@@ -1,20 +1,8 @@
-# SafeClick
+# Highly Available Web Tier on AWS
 
-**Check a link before you trust it.** SafeClick is a website safety checker: enter a URL and it reports whether the site's HTTPS certificate is trusted and which browser security protections it uses, explained in plain language.
+A load-balanced, auto-scaling web tier across two Availability Zones, defined in Terraform and tested for scaling and failure recovery.
 
-This version (v0) runs as a highly available, auto-scaling web service on AWS behind an Application Load Balancer. It was built for CLOUD 495 Mini-Project 2 (Launch, Scale, and Recover a Compute Service) at Franklin University, using SafeClick in place of the sample demo page.
-
-![SafeClick running behind the load balancer](docs/screenshots/07-safeclick-browser.png)
-
-## What it checks
-
-| Check | What it tells you |
-|---|---|
-| TLS certificate | Whether the certificate is trusted, who issued it, when it expires, and the TLS version |
-| Security headers | HSTS, Content Security Policy, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy |
-| Verdict | Green (well configured), yellow (use caution), or red (risky) |
-
-Every page also shows the **Instance ID** and **Availability Zone** that served it, which makes load balancing and failover visible.
+This started as a university cloud computing assignment (CLOUD 495, Franklin University) on designing and deploying a highly available application. I used my own app idea, SafeClick, as the sample workload. The focus of this project is the architecture and how I tested it.
 
 ## Architecture
 
@@ -35,42 +23,117 @@ flowchart LR
     CW[CloudWatch<br/>CPU > 40% triggers scaling] -.-> ASG
 ```
 
+The diagram above is the Terraform design.
+
+![Architecture of the tested manual deployment](docs/architecture.png)
+
+*Architecture of the tested manual deployment.*
+
+The manual build used one shared security group and a health check on `/`. The Terraform version improves on it with separate ALB and web security groups and a dedicated `/health` endpoint.
+
+## Components
+
 | Component | Configuration |
 |---|---|
-| Launch template | Amazon Linux 2023, t2.micro, IMDSv2 required, user data installs SafeClick as a systemd service |
-| Target group | HTTP:80, health check `/health` every 10s, healthy/unhealthy threshold 2, timeout 5s |
-| Load balancer | Internet-facing ALB, HTTP:80 listener, spans two Availability Zones |
-| Auto Scaling | Min 1, desired 1, max 2, ELB health checks, 300s grace period |
-| Scaling policy | Target tracking on average CPU at 40% |
+| VPC | `10.0.0.0/16` with two public subnets (`10.0.0.0/24`, `10.0.1.0/24`) in different Availability Zones |
+| Internet gateway | Attached to the VPC, with a public route table (`0.0.0.0/0`) associated with both subnets |
+| Application Load Balancer | `project2-alb`, internet-facing, IPv4, HTTP:80 listener, spans both subnets, drops invalid header fields |
+| Target group | `project2-targets`, HTTP:80, health check `GET /health` expecting 200 every 10s, 5s timeout, healthy and unhealthy thresholds of 2, 30s deregistration delay |
+| Launch template | `project2-web-template`, latest Amazon Linux 2023 AMI (looked up from SSM), t2.micro, IMDSv2 required (hop limit 1), detailed (1-minute) monitoring, user data installs the app as a systemd service |
+| Auto Scaling group | `project2-asg`, min 1, desired 1, max 2, across both subnets, ELB health checks, 300s grace period, group metrics enabled |
+| Scaling policy | Target tracking on `ASGAverageCPUUtilization` at 40% |
+| CloudWatch | 1-minute instance CPU metrics and the alarms the target tracking policy creates to drive scaling |
 
-## Repository layout
+![Target group health check settings from the manual deployment](docs/screenshots/12-health-check-settings.png)
 
-```
-app/safeclick.py              The app (Python standard library only)
-scripts/build_user_data.py    Packs the app into the EC2 user data script
-infra/                        Terraform for the full environment
-infra/user-data.sh            Generated bootstrap script for the launch template
-tests/                        Unit tests (SSRF blocking, routes, user data)
-.github/workflows/ci.yml      Tests plus terraform fmt and validate on every push
-docs/                         Screenshots and diagram
-```
+*Target group health check settings from the manual deployment.*
 
-## Run it locally
+<details>
+<summary>Screenshots of the manual console deployment</summary>
+
+VPC, subnets, internet gateway, and route table created:
+![VPC creation](docs/screenshots/01-vpc-subnets.png)
+
+Web security group:
+![Security group](docs/screenshots/02-security-groups.png)
+
+Launch template:
+![Launch template](docs/screenshots/03-launch-template.png)
+
+Load balancer active:
+![ALB active](docs/screenshots/04-alb-active.png)
+
+Auto Scaling group at desired capacity:
+![Auto Scaling group](docs/screenshots/05-asg-details.png)
+
+One running instance:
+![Running instance](docs/screenshots/06-running-instance.png)
+
+</details>
+
+## How it stays available
+
+- **No single critical instance.** Every instance is identical and built from the same launch template, so any one of them can be lost and replaced.
+- **The ALB routes only to healthy targets.** It checks `/health` every 10 seconds and stops sending traffic to an instance after two failed checks.
+- **Unhealthy instances are replaced automatically.** The Auto Scaling group uses ELB health checks, so an instance that fails the load balancer's check is terminated and replaced, not just taken out of rotation.
+- **Multi-AZ placement.** The load balancer and the Auto Scaling group span two Availability Zones, so the tier can keep serving if one zone has a problem.
+- **CPU-based scaling.** The target tracking policy adds an instance when average CPU goes above 40% and removes it when load drops.
+- **Self-restarting instances.** The app runs under systemd with `Restart=always`, so if the process crashes it restarts in about 2 seconds without needing a new instance.
+
+## What I tested
+
+These tests used an earlier browser-only version of SafeClick, deployed manually through the AWS console in AWS Academy Learner Lab. This repo contains the improved app and a Terraform template of the same architecture, which I have not applied.
+
+**Load distribution.** I sent repeated `curl` requests to the ALB DNS name. The Instance ID on the page alternated between instances.
 
 ```bash
-PORT=8080 python3 app/safeclick.py
-# open http://localhost:8080
-python3 -m unittest discover tests -v
+for i in {1..10}; do curl -s http://<ALB-DNS> | grep "Instance ID"; sleep 1; done
 ```
 
-## Deploy
+![curl loop showing both instance IDs](docs/screenshots/11-two-instance-ids.png)
 
-### Option A: AWS Console (as in the lab)
-Follow the lab steps, with these changes:
-- **User data:** paste the contents of `infra/user-data.sh`.
-- **Health check path:** `/health` instead of `/`.
+![The page served from the second Availability Zone](docs/screenshots/11b-safeclick-second-az.png)
 
-### Option B: Terraform
+*The page served from the second Availability Zone.*
+
+**Scale-out.** I started a CPU stress process at 11:53 PM. The Auto Scaling group had two instances running by 12:07 AM. I stopped the stress process at 12:17 AM, after which the group scaled back in. CPU peaked at about 99.65%.
+
+```bash
+yes > /dev/null & yes > /dev/null & yes > /dev/null &
+killall yes
+```
+
+![CloudWatch CPU utilization during the stress test](docs/screenshots/08-cloudwatch-cpu.png)
+![Activity history showing the scale-out launch](docs/screenshots/09-asg-scale-out.png)
+![Two running instances in different Availability Zones](docs/screenshots/10-two-instances.png)
+
+**Failure recovery.** I terminated a running instance and the Auto Scaling group launched a replacement at 12:18 AM. During the termination, one request returned a 504 at 12:19:04 AM, then all requests returned 200 again. Requests in flight to an instance as it shuts down can fail; in production I would tune the deregistration delay and rely on connection draining to reduce this.
+
+```bash
+while true; do
+  echo "$(date '+%H:%M:%S') - Status: $(curl -s -o /dev/null -w '%{http_code}' http://<ALB-DNS>/health)"
+  sleep 1
+done
+```
+
+![Availability loop during the instance termination](docs/screenshots/13-availability-loop.png)
+![Activity history showing the replacement launch](docs/screenshots/14-asg-replacement.png)
+
+## Infrastructure as code
+
+[`infra/main.tf`](infra/main.tf) builds the whole environment above: the VPC, subnets, internet gateway and route table, two security groups, the launch template, target group, load balancer and listener, the Auto Scaling group, and the CPU scaling policy.
+
+**Security group design.** I used two security groups instead of one shared group. The internet can reach only the load balancer on port 80. The web instances accept port 80 only from the ALB security group, and SSH only from a single IP set in `ssh_cidr`.
+
+**Hardening and availability features:**
+- **Dedicated `/health` endpoint.** The health check returns a fixed response and never depends on an outside website, so a slow third-party site can't make an instance look unhealthy.
+- **IMDSv2 required.** The launch template requires session tokens for instance metadata.
+- **Sandboxed systemd service.** The app runs as a throwaway user (`DynamicUser=yes`) with `NoNewPrivileges=yes` and only the capability to bind port 80.
+- **Self-contained user data.** [`scripts/build_user_data.py`](scripts/build_user_data.py) compresses the app into [`infra/user-data.sh`](infra/user-data.sh) (under the 16 KB EC2 limit), so new instances boot with nothing to download or install.
+
+**CI.** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and on pull requests. It runs the unit tests, rebuilds the user data and fails if `user-data.sh` is stale, and runs `terraform fmt`, `init`, and `validate`.
+
+To deploy with Terraform:
 
 ```bash
 cd infra
@@ -80,62 +143,50 @@ terraform plan
 terraform apply
 ```
 
-Open the `alb_dns_name` output in a browser. Instances need about 3 to 5 minutes to pass health checks.
-
-## Testing scaling and recovery
-
-**Load distribution**
-```bash
-for i in {1..10}; do curl -s http://<ALB-DNS> | grep "Instance ID"; sleep 1; done
-```
-
-**Scale out:** SSH to the instance and generate CPU load, then watch CloudWatch and the Auto Scaling activity tab.
-```bash
-ssh -i labsuser.pem ec2-user@<INSTANCE-PUBLIC-IP>
-yes > /dev/null & yes > /dev/null & yes > /dev/null &
-killall yes   # when the second instance is healthy
-```
-
-**Failure recovery:** run this, then terminate one instance in the EC2 console.
-```bash
-while true; do
-  echo "$(date '+%H:%M:%S') - Status: $(curl -s -o /dev/null -w '%{http_code}' http://<ALB-DNS>/health)"
-  sleep 1
-done
-```
-
-## Design decisions
-
-- **No dependencies.** The app uses only the Python standard library, so new instances boot without installing packages. Faster boot means Auto Scaling replacements become healthy sooner.
-- **Self-contained user data.** The app is compressed into the user data script, staying under the 16 KB EC2 limit with no `git clone` or internet dependency at boot.
-- **Dedicated `/health` endpoint.** The health check never depends on an outside website, so a slow third-party site can't mark an instance unhealthy.
-- **SSRF protection.** A tool that fetches user-supplied URLs could be pointed at internal addresses, including the EC2 metadata service at 169.254.169.254. SafeClick rejects private, loopback, link-local, and other non-public addresses, allows only ports 80 and 443, and connects to the exact IP it validated to prevent DNS rebinding.
-- **IMDSv2 required.** The launch template requires session tokens for instance metadata.
-- **Least-privilege networking.** The internet reaches only the load balancer. Instances accept HTTP only from the load balancer's security group and SSH only from one IP.
-- **Unprivileged service.** systemd runs the app as a throwaway user with only the capability to bind port 80.
-- **Practices what it checks.** SafeClick's own responses send CSP, X-Frame-Options, and other security headers.
-
-## AWS Academy Learner Lab notes
-
-- Learner Lab doesn't allow creating IAM roles, so instances use the built-in `LabInstanceProfile`.
-- The key pair is the built-in `vockey` (download `labsuser.pem` from AWS Details).
-- An Application Load Balancer needs subnets in at least two Availability Zones, so the VPC has two public subnets.
-- Lab sessions end after a few hours, but the load balancer keeps using the lab budget. Clean up when finished.
+| Path | Contents |
+|---|---|
+| `infra/` | Terraform for the full environment |
+| `infra/user-data.sh` | Generated bootstrap script for the launch template |
+| `scripts/build_user_data.py` | Packs the app into the user data script |
+| `app/safeclick.py` | The sample workload (Python standard library only) |
+| `tests/` | Unit tests (SSRF blocking, routes, user data) |
+| `docs/` | Screenshot checklist |
 
 ## Issues I ran into
 
-<!-- Fill in after deploying: what broke, how you diagnosed it, and the fix. -->
+- The target group could not be deleted while the ALB listener still used it, so I deleted in order: Auto Scaling group, then load balancer, then target group.
+- The EC2 Instances page looked empty after the Auto Scaling group was created. I confirmed the launch in the ASG Activity tab and then found the instance.
+- Learner Lab does not allow creating IAM roles, so I used the precreated `LabInstanceProfile`.
+
+## Known limitations and production changes
+
+| Current state | What I would do in production |
+|---|---|
+| HTTP only | HTTPS with an ACM certificate on the ALB |
+| Instances in public subnets | Private subnets with a NAT gateway, only the ALB public |
+| No `instance_refresh`, so launch template changes don't reach running instances | Add an `instance_refresh` block to the Auto Scaling group |
+| No rate limit or concurrency cap on `/api/scan` | Rate limiting in the app, or a WAF rate-based rule on the ALB |
+| The `ssh_cidr` validation only rejects the exact string `0.0.0.0/0` | Stricter validation that requires a /32, or remove SSH and use Session Manager |
+
+## About the sample app
+
+SafeClick checks a site's HTTPS certificate and security headers and returns a green, yellow, or red verdict with reasons. Each page shows the Instance ID and Availability Zone that served it, which made load balancing visible during testing. The scanner blocks requests to private and internal addresses, including the EC2 metadata service, to prevent SSRF.
+
+![The earlier SafeClick version served through the load balancer](docs/screenshots/07-safeclick-browser.png)
+
+## Learner Lab notes
+
+- Instances use the built-in `LabInstanceProfile` and the `vockey` key pair (download `labsuser.pem` from AWS Details).
+- The load balancer keeps using the lab budget after the session ends, so clean up when finished.
 
 ## Cleanup
 
-Terraform: `terraform destroy`
+- Terraform: `terraform destroy`
+- Console: delete the Auto Scaling group first (otherwise it launches replacements), then the load balancer, then the target group.
 
-Console: delete the Auto Scaling group first (otherwise it launches replacements), then the load balancer, then the target group.
+## Run locally
 
-## Roadmap
-
-- AI assistant that explains results and answers follow-up questions
-- Domain age and phishing blocklist checks
-- Scan history
-- File checker (hash lookup against malware databases)
-- HTTPS on the load balancer with an ACM certificate
+```bash
+PORT=8080 python3 app/safeclick.py   # open http://localhost:8080
+python3 -m unittest discover tests -v
+```

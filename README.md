@@ -1,4 +1,4 @@
-# Highly Available Web Tier on AWS
+# Highly Available Web App on AWS
 
 A load-balanced, auto-scaling web tier across two Availability Zones, defined in Terraform and tested for scaling and failure recovery.
 
